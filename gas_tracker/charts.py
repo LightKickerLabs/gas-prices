@@ -10,6 +10,8 @@ from .events import Event
 PRICE_COLOR = "#2a78d6"
 FORECAST_COLOR = "#eb6834"
 BAND_COLOR = "rgba(235, 104, 52, 0.16)"
+SCENARIO_COLOR = "#4a3aa7"
+SCENARIO_BAND = "rgba(74, 58, 167, 0.16)"
 EVENT_COLORS = {"up": "#e34948", "down": "#1baf7a"}
 EVENT_SYMBOLS = {"up": "triangle-up", "down": "triangle-down"}
 EVENT_LABELS = {"up": "Event: pushed prices up", "down": "Event: pushed prices down"}
@@ -26,6 +28,8 @@ def build_chart(
     events: list[Event],
     chart_type: str,
     resolution: str,
+    scenario: pd.DataFrame | None = None,
+    scenario_marks: list[tuple[pd.Timestamp, str]] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     period = "Month of" if resolution == "Monthly" else "Week of"
@@ -39,32 +43,17 @@ def build_chart(
                         line=dict(color=PRICE_COLOR, width=2), hovertemplate=hover)
 
     if forecast is not None and len(forecast):
-        fc_hover = (f"{period} %{{x|%b %d, %Y}}<br>Forecast <b>$%{{y:.3f}}</b>"
-                    "<br>95% range $%{customdata[0]:.2f} - $%{customdata[1]:.2f}<extra></extra>")
-        custom = forecast[["lower", "upper"]].to_numpy()
-        if chart_type == "Bar":
-            fig.add_bar(
-                x=forecast.index, y=forecast["yhat"], name="Forecast",
-                marker=dict(color=FORECAST_COLOR, opacity=0.7),
-                error_y=dict(type="data", symmetric=False,
-                             array=forecast["upper"] - forecast["yhat"],
-                             arrayminus=forecast["yhat"] - forecast["lower"],
-                             color=FORECAST_COLOR, thickness=1),
-                customdata=custom, hovertemplate=fc_hover,
-            )
+        if scenario is None:
+            _add_forecast(fig, history, forecast, "Forecast", FORECAST_COLOR, BAND_COLOR, chart_type, period)
         else:
-            fig.add_scatter(x=forecast.index, y=forecast["upper"], mode="lines", line=dict(width=0),
-                            showlegend=False, hoverinfo="skip")
-            fig.add_scatter(x=forecast.index, y=forecast["lower"], mode="lines", line=dict(width=0),
-                            fill="tonexty", fillcolor=BAND_COLOR, name="95% forecast range",
-                            hoverinfo="skip")
-            # Start the forecast line at the last actual point so the two lines connect.
-            fx = [history.index[-1], *forecast.index]
-            fy = [history.iloc[-1], *forecast["yhat"]]
-            fcd = [[history.iloc[-1], history.iloc[-1]], *custom]
-            fig.add_scatter(x=fx, y=fy, name="Forecast", mode="lines",
-                            line=dict(color=FORECAST_COLOR, width=2, dash="dash"),
-                            customdata=fcd, hovertemplate=fc_hover)
+            # Baseline stays visible as a thin reference line; the scenario gets the bars/band.
+            _add_forecast(fig, history, forecast, "Baseline forecast", FORECAST_COLOR, None, "Line", period)
+            _add_forecast(fig, history, scenario, "Your scenario", SCENARIO_COLOR, SCENARIO_BAND,
+                          chart_type, period)
+        for when, label in scenario_marks or []:
+            fig.add_vline(x=when, line=dict(color=SCENARIO_COLOR, width=1, dash="dot"), opacity=0.6)
+            fig.add_annotation(x=when, y=1, yref="paper", text=f"<b>{label}</b>", showarrow=False,
+                               yanchor="bottom", font=dict(size=11, color=SCENARIO_COLOR))
 
     if events:
         span = float(history.max() - history.min()) or 0.5
@@ -98,3 +87,32 @@ def build_chart(
         xaxis=dict(title=None, showspikes=True, spikemode="across", spikethickness=1, spikedash="dot"),
     )
     return fig
+
+
+def _add_forecast(fig: go.Figure, history: pd.Series, frame: pd.DataFrame, name: str, color: str,
+                  band_color: str | None, chart_type: str, period: str) -> None:
+    hover = (f"{period} %{{x|%b %d, %Y}}<br>{name} <b>$%{{y:.3f}}</b>"
+             "<br>95% range $%{customdata[0]:.2f} - $%{customdata[1]:.2f}<extra></extra>")
+    custom = frame[["lower", "upper"]].to_numpy()
+    if chart_type == "Bar":
+        fig.add_bar(
+            x=frame.index, y=frame["yhat"], name=name,
+            marker=dict(color=color, opacity=0.7),
+            error_y=dict(type="data", symmetric=False,
+                         array=frame["upper"] - frame["yhat"],
+                         arrayminus=frame["yhat"] - frame["lower"],
+                         color=color, thickness=1),
+            customdata=custom, hovertemplate=hover,
+        )
+        return
+    if band_color:
+        fig.add_scatter(x=frame.index, y=frame["upper"], mode="lines", line=dict(width=0),
+                        showlegend=False, hoverinfo="skip")
+        fig.add_scatter(x=frame.index, y=frame["lower"], mode="lines", line=dict(width=0),
+                        fill="tonexty", fillcolor=band_color, name=f"95% range ({name.lower()})",
+                        hoverinfo="skip")
+    # Start the line at the last actual point so it connects to the history.
+    last = float(history.iloc[-1])
+    fig.add_scatter(x=[history.index[-1], *frame.index], y=[last, *frame["yhat"]], name=name, mode="lines",
+                    line=dict(color=color, width=2 if band_color else 1.5, dash="dash"),
+                    customdata=[[last, last], *custom], hovertemplate=hover)

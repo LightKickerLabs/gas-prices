@@ -11,7 +11,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from gas_tracker import charts, data, events, forecast
+from gas_tracker import charts, data, events, forecast, scenario_ui, scenarios
 
 st.set_page_config(page_title="Gas Price Tracker", page_icon="⛽", layout="wide")
 
@@ -44,7 +44,7 @@ def run_forecast(series: pd.Series, horizon_weeks: int) -> forecast.Forecast:
 # ---------------------------------------------------------------- sidebar: where & what
 with st.sidebar:
     st.header("⛽ Area & data")
-    area_name = st.selectbox("Area", list(data.AREAS), index=list(data.AREAS).index(data.DEFAULT_AREA))
+    area_name = st.selectbox("Area", list(data.AREAS), index=list(data.AREAS).index(data.DEFAULT_AREA), key="area")
     area = data.AREAS[area_name]
     grade = st.selectbox("Fuel grade", list(data.GRADES))
 
@@ -59,6 +59,13 @@ with st.sidebar:
     offset_cents = st.number_input("Local adjustment (¢/gal)", value=0, step=5, min_value=-200, max_value=200,
                                    help="Shift the series up or down, e.g. +20 to approximate Sacramento "
                                         "from the California average.")
+
+    st.subheader("What-if AI")
+    anthropic_key = _secret("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        anthropic_key = st.text_input("Anthropic API key (optional)", type="password",
+                                      help="Lets Claude turn scenarios written in your own words into price "
+                                           "effects. Or set ANTHROPIC_API_KEY.")
 
 # ---------------------------------------------------------------- load the series
 source_label, notice = "", None
@@ -138,33 +145,100 @@ if show_forecast and forecast_allowed:
     fc = run_forecast(series, forecast.months_to_weeks(horizon_months))
 
 display = data.aggregate(window, resolution)
-fc_display = None
-if fc is not None:
-    fc_display = fc.frame
-    if resolution == "Monthly":
-        fc_display = fc.frame.resample("MS").mean()
-
 window_events = events.events_for(area.region, window_start, window_end, include_seasonal) if show_events else []
 
-# ---------------------------------------------------------------- headline numbers
-m1, m2, m3, m4 = st.columns(4)
-now, first = float(window.iloc[-1]), float(window.iloc[0])
-m1.metric(f"Price, week of {window.index[-1]:%b %d}", f"${now:.2f}",
-          f"{now - first:+.2f} vs {window.index[0]:%b %d, %Y}", delta_color="inverse")
-m2.metric("High in range", f"${window.max():.2f}", f"{window.idxmax():%b %d, %Y}", delta_color="off")
-m3.metric("Low in range", f"${window.min():.2f}", f"{window.idxmin():%b %d, %Y}", delta_color="off")
+# Metrics and chart depend on the what-if panel below them, so reserve their slots first.
+metrics_slot = st.container()
+chart_slot = st.container()
+
+actives: list[scenarios.Active] = []
+scenario_fc = contributions = None
 if fc is not None:
-    end = fc.frame.iloc[-1]
-    m4.metric(f"Predicted in {horizon_months} mo ({fc.frame.index[-1]:%b %d})", f"${end.yhat:.2f}",
-              f"{end.yhat - float(series.iloc[-1]):+.2f} · range \\${end.lower:.2f}–\\${end.upper:.2f}",
-              delta_color="inverse")
+    recent = events.events_for(area.region, latest_date - pd.DateOffset(months=12), latest_date, False)
+    actives = scenario_ui.render(
+        area, latest_date, float(series.iloc[-1]), fc.frame.index[-1],
+        [f"{e.date}: {e.title}" for e in recent], anthropic_key,
+    )
+    if actives:
+        scenario_fc, contributions = scenarios.apply(fc.frame, actives)
 else:
-    m4.metric("Prediction", "Off" if not show_forecast else "n/a",
-              None if show_forecast is False else "Range must end at latest data", delta_color="off")
+    st.caption("🔮 Turn on **Show prediction** (with a timeframe ending at the latest data) to explore "
+               "what-if scenarios.")
+
+
+def _for_display(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    if frame is not None and resolution == "Monthly":
+        return frame.resample("MS").mean()
+    return frame
+
+
+# ---------------------------------------------------------------- headline numbers
+with metrics_slot:
+    m1, m2, m3, m4 = st.columns(4)
+    now, first = float(window.iloc[-1]), float(window.iloc[0])
+    m1.metric(f"Price, week of {window.index[-1]:%b %d}", f"${now:.2f}",
+              f"{now - first:+.2f} vs {window.index[0]:%b %d, %Y}", delta_color="inverse")
+    m2.metric("High in range", f"${window.max():.2f}", f"{window.idxmax():%b %d, %Y}", delta_color="off")
+    m3.metric("Low in range", f"${window.min():.2f}", f"{window.idxmin():%b %d, %Y}", delta_color="off")
+    if fc is not None:
+        base_end = fc.frame.iloc[-1]
+        label = f"Predicted in {horizon_months} mo ({fc.frame.index[-1]:%b %d})"
+        if scenario_fc is not None:
+            end = scenario_fc.iloc[-1]
+            m4.metric(f"Your scenario in {horizon_months} mo ({fc.frame.index[-1]:%b %d})", f"${end.yhat:.2f}",
+                      f"{end.yhat - base_end.yhat:+.2f} vs baseline \\${base_end.yhat:.2f}", delta_color="inverse")
+        else:
+            m4.metric(label, f"${base_end.yhat:.2f}",
+                      f"{base_end.yhat - float(series.iloc[-1]):+.2f} · range "
+                      f"\\${base_end.lower:.2f}–\\${base_end.upper:.2f}",
+                      delta_color="inverse")
+    else:
+        m4.metric("Prediction", "Off" if not show_forecast else "n/a",
+                  None if show_forecast is False else "Range must end at latest data", delta_color="off")
 
 # ---------------------------------------------------------------- chart
-fig = charts.build_chart(display, fc_display, window_events, chart_type, resolution)
-st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+fc_display = _for_display(fc.frame if fc is not None else None)
+scenario_display = _for_display(scenario_fc)
+# Scenarios that start inside the horizon get a lettered marker, matching the table below.
+in_horizon = sorted((a for a in actives if fc is not None and latest_date < a.start <= fc.frame.index[-1]),
+                    key=lambda a: a.start)
+letters = {a.name: chr(ord("A") + i) for i, a in enumerate(in_horizon)}
+marks = [(a.start, letters[a.name]) for a in actives if a.name in letters]
+with chart_slot:
+    fig = charts.build_chart(display, fc_display, window_events, chart_type, resolution,
+                             scenario=scenario_display, scenario_marks=marks)
+    st.plotly_chart(fig, width="stretch", theme="streamlit")
+
+if contributions is not None:
+    horizon_end = fc.frame.index[-1]
+    rows = []
+    for a in actives:
+        col = contributions[a.name]
+        peak = col.iloc[col.abs().to_numpy().argmax()] if len(col) else 0.0
+        after = a.start > horizon_end
+        rows.append({
+            "Mark": letters.get(a.name, ""),
+            "Scenario": a.name,
+            "Starts": f"{a.start:%Y-%m-%d}" + (" (after horizon)" if after else ""),
+            f"Effect by {horizon_end:%b %d, %Y}": float(col.iloc[-1]),
+            "Peak effect": float(peak),
+            "Assumption": a.assumption,
+        })
+    total = contributions.sum(axis=1)
+    rows.append({"Mark": "", "Scenario": "Total", "Starts": "",
+                 f"Effect by {horizon_end:%b %d, %Y}": float(total.iloc[-1]),
+                 "Peak effect": float(total.iloc[total.abs().to_numpy().argmax()]), "Assumption": ""})
+    st.markdown("**How your scenario changes the prediction** ($/gal vs. baseline)")
+    if any(a.start > horizon_end for a in actives):
+        st.caption("Some scenarios start after your prediction horizon. Lengthen the horizon to see them.")
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch",
+        column_config={
+            f"Effect by {horizon_end:%b %d, %Y}": st.column_config.NumberColumn(format="%+.2f"),
+            "Peak effect": st.column_config.NumberColumn(format="%+.2f"),
+            "Assumption": st.column_config.TextColumn(width="large"),
+        },
+    )
 
 # ---------------------------------------------------------------- events
 if show_events:
@@ -186,7 +260,7 @@ if show_events:
                 "Source": e.source,
             })
         st.dataframe(
-            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            pd.DataFrame(rows), hide_index=True, width="stretch",
             column_config={
                 "#": st.column_config.NumberColumn(width="small"),
                 "Why it matters": st.column_config.TextColumn(width="large"),
@@ -214,8 +288,10 @@ with st.expander("Data table & download"):
     table.index.name = "Month" if resolution == "Monthly" else "Week"
     if fc_display is not None:
         f = fc_display.rename(columns={"yhat": "Forecast ($/gal)", "lower": "Low (95%)", "upper": "High (95%)"})
+        if scenario_display is not None:
+            f["Your scenario ($/gal)"] = scenario_display["yhat"]
         table = pd.concat([table, f])
-    st.dataframe(table.round(3), use_container_width=True)
+    st.dataframe(table.round(3), width="stretch")
     st.download_button("Download CSV", table.round(3).to_csv().encode(),
                        file_name=f"gas-prices-{area_name.split(',')[0].lower().replace(' ', '-')}-{date.today()}.csv",
                        mime="text/csv")

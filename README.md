@@ -15,6 +15,13 @@ marks the news events that moved prices, and predicts where prices are heading.
   ceasefires, OPEC+ decisions, California policy) plotted on the chart as numbered ▲/▼ markers,
   with a table showing how prices moved in the four weeks after each event. Optional seasonal
   events (summer/winter blend, July 1 gas-tax adjustment) and a live Google News headline feed.
+- **What-if scenarios** – say how upcoming events will go and the prediction adjusts. Pick outcomes for
+  local (California governor race, refinery outages, state gas tax, climate fuel rules), national
+  (2026 midterms, federal gas-tax holiday, Strategic Petroleum Reserve, recession, Gulf hurricanes) and
+  global questions (US–Iran war / Hormuz, OPEC+, Russia–Ukraine, China demand). Each outcome comes
+  with an editable ¢/gal effect and timing; the chart shows your scenario against the baseline, with
+  a breakdown of each assumption. You can also add your own events, or **describe them in plain English
+  and have Claude estimate the effects** (needs an Anthropic API key).
 - **Data table & CSV download** of the history and forecast.
 
 ## Run it
@@ -43,6 +50,19 @@ streamlit run app.py
 Holt-Winters exponential smoothing (damped trend + yearly seasonality) trained on all available
 weekly history, not just the visible window. It extrapolates trends and seasonal patterns; it
 can't anticipate new shocks such as refinery outages or wars.
+
+## How what-if scenarios work
+
+Each outcome is an assumed change in cents per gallon relative to the baseline forecast (which
+already reflects today's conditions). Effects ramp in over a few weeks and either persist or fade
+after a set period; crude-oil events convert at ≈2.4¢/gal per $1/bbl. Uncertainty from each scenario
+widens the forecast band. The default sizes are rough starting points drawn from past episodes; edit
+them in the app or in `gas_tracker/scenarios.py`. Political outcomes deliberately carry small effects:
+pump prices mostly follow crude oil and refining, not who controls Congress.
+
+For the plain-English option, set `ANTHROPIC_API_KEY` (env var or `.streamlit/secrets.toml`) or paste
+a key in the sidebar. The app sends your text plus the area, latest price and recent events to Claude
+and gets back structured effects you can review and remove.
 
 ## Adding events
 
