@@ -1,6 +1,8 @@
-streamlit>=1.40
+streamlit>=1.50
 pandas>=2.2
 numpy>=1.26
 plotly>=5.22
 statsmodels>=0.14
 requests>=2.31
+anthropic>=1.8
+pydantic>=2
